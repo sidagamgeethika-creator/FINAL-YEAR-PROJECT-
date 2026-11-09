@@ -1,0 +1,505 @@
+ESP-32 CODE
+/******************** LIBRARIES ********************/
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+
+/******************** WIFI CONFIG ********************/
+const char* ssid = "123456789";
+const char* password = "1234567890";
+
+/******************** THINGSPEAK ********************/
+String apiKey = "5EGG7GQIM37G6370";
+const char* server = "http://api.thingspeak.com/update";
+
+/******************** PIN CONFIG ********************/
+#define DHTPIN 5
+#define DHTTYPE DHT11
+#define ONE_WIRE_BUS 4
+
+/******************** GSM SERIAL ********************/
+HardwareSerial gsm(2);
+#define GSM_RX 16
+#define GSM_TX 17
+
+/******************** OBJECTS ********************/
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MAX30105 particleSensor;
+
+/******************** VARIABLES ********************/
+float roomTemp, humidity, bodyTemp;
+int heartRate = 0;
+int spo2 = 0;
+
+unsigned long lastSend = 0;
+unsigned long lastAlert = 0;
+
+/******************** BUFFERS ********************/
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+/******************** BODY TEMP AVG ********************/
+float avgBodyTemp() {
+  float sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sensors.requestTemperatures();
+    sum += sensors.getTempCByIndex(0);
+    delay(200);
+  }
+  return sum / 5.0;
+}
+
+/******************** MAX30102 ********************/
+void readMAX30102() {
+  for (byte i = 0; i < BUFFER_SIZE; i++) {
+    while (!particleSensor.available())
+      particleSensor.check();
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+  }
+
+  int32_t spo2Val;
+  int8_t spo2Valid;
+  int32_t hrVal;
+  int8_t hrValid;
+
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, BUFFER_SIZE, redBuffer,
+    &spo2Val, &spo2Valid,
+    &hrVal, &hrValid
+  );
+
+  if (spo2Valid) spo2 = spo2Val;
+  if (hrValid) heartRate = hrVal;
+}
+
+/******************** GSM INIT ********************/
+void initGSM() {
+  gsm.println("AT");
+  delay(1000);
+
+  gsm.println("ATE0"); // Echo OFF
+  delay(1000);
+
+  gsm.println("AT+CMGF=1"); // SMS TEXT MODE
+  delay(1000);
+
+  gsm.println("AT+CSQ"); // Signal strength
+  delay(1000);
+
+  gsm.println("AT+CREG?"); // Network check
+  delay(1000);
+}
+
+/******************** SEND SMS ********************/
+void sendSMS(String msg) {
+  gsm.println("AT+CMGF=1");
+  delay(1000);
+
+  gsm.println("AT+CMGS=\"+917569000477\"");
+  delay(2000);
+
+  gsm.print(msg);
+  delay(500);
+
+  gsm.write(26); // CTRL+Z
+  delay(5000);
+}
+
+/******************** MAKE CALL ********************/
+void makeCall() {
+  gsm.println("ATD+917569000477;");
+  delay(20000); // 20 sec call
+  gsm.println("ATH");
+}
+
+/******************** LCD ********************/
+void displayData() {
+
+  lcd.clear();
+
+  // ALERT SCREEN
+  if (bodyTemp > 38.5) {
+    lcd.setCursor(0, 0);
+    lcd.print("!!! ALERT !!!");
+
+    lcd.setCursor(0, 1);
+    lcd.print("BODY TEMP HIGH");
+    return;
+  }
+
+  // NORMAL DISPLAY
+  lcd.setCursor(0, 0);
+  lcd.print("HR:");
+  lcd.print(heartRate);
+  lcd.print(" SpO2:");
+  lcd.print(spo2);
+
+  lcd.setCursor(0, 1);
+  lcd.print("BT:");
+  lcd.print(bodyTemp, 1);
+  lcd.print(" H:");
+  lcd.print(humidity, 0);
+}
+
+/******************** THINGSPEAK ********************/
+void sendToThingSpeak() {
+  if (WiFi.status() == WL_CONNECTED) {
+
+    HTTPClient http;
+
+    String url = server;
+    url += "?api_key=" + apiKey;
+    url += "&field1=" + String(heartRate);
+    url += "&field2=" + String(spo2);
+    url += "&field3=" + String(bodyTemp);
+    url += "&field4=" + String(roomTemp);
+    url += "&field5=" + String(humidity);
+
+    http.begin(url);
+    http.GET();
+    http.end();
+  }
+}
+
+/******************** SETUP ********************/
+void setup() {
+
+  Serial.begin(115200);
+
+  dht.begin();
+  sensors.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  gsm.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+  initGSM();
+
+  Wire.begin(21, 22);
+
+  /******** MAX30102 ********/
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found");
+    while (1);
+  }
+  particleSensor.setup();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Health Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+
+  /******** WIFI ********/
+  WiFi.begin(ssid, password);
+  lcd.clear();
+  lcd.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    lcd.print(".");
+  }
+
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  delay(1500);
+}
+
+/******************** LOOP ********************/
+void loop() {
+
+  /******** DHT ********/
+  humidity = dht.readHumidity();
+  roomTemp = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(roomTemp)) {
+    humidity = 0;
+    roomTemp = 0;
+  }
+
+  /******** BODY TEMP ********/
+  bodyTemp = avgBodyTemp();
+
+  /******** MAX30102 ********/
+  readMAX30102();
+
+  /******** DISPLAY ********/
+  displayData();
+
+  /******** GSM ALERT ********/
+  if (bodyTemp > 38.5 && millis() - lastAlert > 60000) {
+
+    String msg = "P13:ALERT!\nBT:" + String(bodyTemp) +
+                 "\nHR:" + String(heartRate) +
+                 "\nSpO2:" + String(spo2);
+
+    sendSMS(msg);
+    delay(3000);
+    makeCall();
+
+    lastAlert = millis();
+  }
+
+  /******** THINGSPEAK (5 sec) ********/
+  if (millis() - lastSend > 3000) {
+    sendToThingSpeak();
+    lastSend = millis();
+  }
+
+  delay(2000);
+}
+PYTHON CODE
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+
+# ML ALGORITHM: Random Forest Classification
+from sklearn.ensemble import RandomForestClassifier
+
+# DATA SPLITTING ALGORITHM: Train-Test Split
+from sklearn.model_selection import train_test_split
+
+# EVALUATION METRIC: Accuracy Score
+from sklearn.metrics import accuracy_score
+
+
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(page_title="MedTest Tool", layout="wide")
+
+
+# ---------------- CUSTOM CSS (PREMIUM UI) ----------------
+st.markdown("""
+<style>
+
+/* FULL BACKGROUND */
+.stApp {
+    background: linear-gradient(rgba(5,10,25,0.88), rgba(5,10,25,0.96)),
+                url("https://img.freepik.com/free-photo/futuristic-doctor-with-tablet_23-2151112193.jpg");
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+}
+
+/* REMOVE SIDEBAR */
+[data-testid="stSidebar"] {
+    display: none;
+}
+
+/* MAIN FLEX */
+.main-container {
+    display: flex;
+    height: 100vh;
+    align-items: center;
+    justify-content: space-between;
+    padding: 50px;
+}
+
+/* LEFT SIDE SPACE */
+.left-space {
+    flex: 1;
+}
+
+/* RIGHT PANEL (GLASS UI) */
+.panel {
+    flex: 1;
+    max-width: 520px;
+    background: rgba(255,255,255,0.08);
+    padding: 40px;
+    border-radius: 25px;
+    backdrop-filter: blur(25px);
+    box-shadow: 0 0 60px rgba(0,255,255,0.2);
+}
+
+/* TITLE */
+.title {
+    font-size: 48px;
+    font-weight: 900;
+    color: #00f5ff;
+}
+
+/* SUBTITLE */
+.subtitle {
+    color: white;
+    font-size: 15px;
+    margin-bottom: 20px;
+}
+
+/* FORCE WHITE TEXT EVERYWHERE */
+label, .stRadio label, .stNumberInput label, div[role="radiogroup"] label {
+    color: white !important;
+    font-size: 16px !important;
+}
+
+/* SECTION HEADINGS (FIXED WHITE) */
+.section {
+    margin-top: 20px;
+    font-size: 24px;
+    font-weight: 700;
+    color: white !important;
+}
+
+/* DATA TEXT */
+.data {
+    font-size: 20px;
+    color: white !important;
+    margin: 6px 0;
+}
+
+/* INPUT BOX */
+input, .stNumberInput input {
+    background-color: rgba(0,0,0,0.7) !important;
+    color: white !important;
+    border-radius: 12px !important;
+    border: 1px solid #00f5ff !important;
+}
+
+/* BUTTON */
+.stButton>button {
+    width: 100%;
+    background: linear-gradient(90deg, #00f5ff, #00ff9c);
+    color: black;
+    font-weight: bold;
+    border-radius: 12px;
+    height: 48px;
+    font-size: 17px;
+    box-shadow: 0 0 15px rgba(0,255,255,0.5);
+}
+
+/* RESULT */
+.result-good {
+    margin-top: 20px;
+    padding: 18px;
+    background: rgba(0,255,150,0.15);
+    border-radius: 15px;
+    font-size: 28px;
+    font-weight: bold;
+    color: #00ff9c;
+}
+
+.result-bad {
+    margin-top: 20px;
+    padding: 18px;
+    background: rgba(255,50,50,0.2);
+    border-radius: 15px;
+    font-size: 28px;
+    font-weight: bold;
+    color: #ff4b4b;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------- LOAD DATA ----------------
+# DATA PREPROCESSING: CSV Loading + Label Encoding
+data = pd.read_csv("data.csv")
+data["Condition"] = data["Condition"].map({"good": 1, "bad": 0})
+
+X = data.drop("Condition", axis=1)
+y = data["Condition"]
+
+
+# ---------------- MODEL TRAINING ----------------
+# ALGORITHM: Random Forest Classifier (Ensemble Learning)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+
+model = RandomForestClassifier(n_estimators=100)
+model.fit(X_train, y_train)
+
+# MODEL EVALUATION: Accuracy Calculation
+accuracy = accuracy_score(y_test, model.predict(X_test))
+
+
+# ---------------- UI START ----------------
+st.markdown('<div class="main-container">', unsafe_allow_html=True)
+
+# LEFT SPACE
+st.markdown('<div class="left-space"></div>', unsafe_allow_html=True)
+
+# RIGHT PANEL
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+
+# TITLE
+st.markdown('<div class="title">🩺 MEDTEST TOOL</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Virtual Doctors made in ALIET @ Vijayawada</div>', unsafe_allow_html=True)
+
+
+# ---------------- MODE SELECTION ----------------
+# UI COMPONENT: Radio Button Selection
+mode = st.radio("Select Mode", ["Auto (ThingSpeak)", "Manual"])
+
+prediction = None
+
+
+# ---------------- AUTO MODE ----------------
+# IOT DATA FETCHING: ThingSpeak API Integration
+if mode == "Auto (ThingSpeak)":
+    st.markdown('<div class="section">📡 AUTO MODE - LIVE IOT DATA</div>', unsafe_allow_html=True)
+
+    channel_id = "3316525"
+    api_key = "ALSA6339QNRUMTV8"
+
+    url = f"https://api.thingspeak.com/channels/{channel_id}/feeds/last.json?api_key={api_key}"
+
+    try:
+        response = requests.get(url)
+        data_ts = response.json()
+
+        heart = float(data_ts["field1"])
+        spo2 = float(data_ts["field2"])
+        body = float(data_ts["field3"])
+        room = float(data_ts["field4"])
+
+        st.markdown(f'<div class="data">❤️ Heart Rate: {heart}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="data">🫁 SpO2: {spo2}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="data">🌡 Body Temp: {body}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="data">🏠 Room Temp: {room}</div>', unsafe_allow_html=True)
+
+        # PREDICTION LOGIC
+        input_data = np.array([[heart, spo2, body, room]])
+        prediction = model.predict(input_data)[0]
+
+    except:
+        st.error("⚠ Unable to fetch IoT data")
+
+
+# ---------------- MANUAL MODE ----------------
+# USER INPUT COLLECTION: Manual Data Entry
+else:
+    st.markdown('<div class="section">✍ MANUAL MODE - ENTER DATA</div>', unsafe_allow_html=True)
+
+    heart = st.number_input("Heart Rate", value=80)
+    spo2 = st.number_input("SpO2", value=95)
+    body = st.number_input("Body Temperature", value=30.0)
+    room = st.number_input("Room Temperature", value=25.0)
+
+    if st.button("🔍 Predict Now"):
+        # PREDICTION LOGIC
+        input_data = np.array([[heart, spo2, body, room]])
+        prediction = model.predict(input_data)[0]
+
+
+# ---------------- RESULT ----------------
+# OUTPUT DISPLAY: Condition Classification
+if prediction is not None:
+    if prediction == 1:
+        st.markdown('<div class="result-good">🟢 HEALTH STATUS: NORMAL</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="result-bad">🔴 HEALTH STATUS: CRITICAL</div>', unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
